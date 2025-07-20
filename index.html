@@ -1,0 +1,144 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Estimador Dinámico GDMTH vs MEM + Informe (con Proxy)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; max-width: 800px; }
+    input, select, button { padding: 10px; margin: 10px 0; width: 100%; }
+    .resultado { margin-top: 20px; padding: 20px; border: 1px solid #ccc; }
+    canvas { margin-top: 40px; }
+  </style>
+</head>
+<body>
+  <h1>Estimador Dinámico GDMTH vs Mercado Eléctrico</h1>
+  <label for="nodo">Selecciona Nodo CENACE:</label>
+  <select id="nodo">
+    <option value="01PLO-115">01PLO-115 (Puebla)</option>
+    <option value="01MEX-045">01MEX-045 (CDMX)</option>
+    <option value="01GDL-081">01GDL-081 (Guadalajara)</option>
+    <option value="01MTY-004">01MTY-004 (Monterrey)</option>
+  </select>
+  <input type="number" id="consumo" placeholder="Consumo mensual en kWh" min="0">
+  <button onclick="runEstimador()">Estimar y generar informe</button>
+  <div class="resultado" id="resultado" style="display:none;"></div>
+  <button id="descargar" style="display:none;" onclick="descargarInforme()">Descargar Informe</button>
+  <canvas id="chart" width="800" height="400"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    const proxy = "https://cors-anywhere.herokuapp.com/";
+    let labelsGlobal = [], datosGlobal = [], resumenGlobal = "";
+
+    async function runEstimador() {
+      const nodo = document.getElementById('nodo').value;
+      const c = parseFloat(document.getElementById('consumo').value);
+      const res = document.getElementById('resultado');
+      const btn = document.getElementById('descargar');
+      res.style.display = 'block';
+      btn.style.display = 'none';
+
+      if (isNaN(c) || c <= 0) {
+        res.innerHTML = "<strong>Ingresa un consumo válido.</strong>";
+        return;
+      }
+
+      try {
+        const {labels, datos} = await obtenerPML12meses("SIN", "MDA", nodo);
+        const precioMEM = promedio(datos);
+        const tarifaGDMTH = await obtenerTarifaGDMTH();
+
+        const costoCFE = c * tarifaGDMTH;
+        const costoMEM = c * precioMEM;
+        const ahorro = costoCFE - costoMEM;
+
+        resumenGlobal = `
+Nodo seleccionado: ${nodo}
+Consumo mensual: ${c} kWh
+Precio promedio MEM: $${precioMEM.toFixed(2)} MXN/kWh
+Tarifa GDMTH: $${tarifaGDMTH.toFixed(2)} MXN/kWh
+Costo CFE: $${costoCFE.toFixed(2)} MXN
+Costo MEM: $${costoMEM.toFixed(2)} MXN
+Ahorro estimado: $${ahorro.toFixed(2)} MXN
+`;
+
+        labelsGlobal = labels;
+        datosGlobal = datos;
+
+        res.innerHTML = resumenGlobal.replace(/\n/g, "<br>");
+        btn.style.display = 'inline';
+        dibujarGrafica(labels, datos);
+      } catch (e) {
+        res.innerHTML = "<strong>Error al obtener datos.</strong>";
+        console.error(e);
+      }
+    }
+
+    async function obtenerPML12meses(sistema, proceso, nodo) {
+      const hoy = new Date();
+      const resultados = [];
+      const labels = [];
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date(hoy.getFullYear(), hoy.getMonth() - i, 1);
+        const y = d.getFullYear(), m = d.getMonth()+1;
+        const start = `${y}/${String(m).padStart(2,'0')}/01`;
+        const end = `${y}/${String(m).padStart(2,'0')}/${new Date(y,m,0).getDate()}`;
+        const url = `${proxy}https://ws01.cenace.gob.mx:8082/SWPML/SIM/${sistema}/${proceso}/${nodo}/${start}/${end}/JSON`;
+        const resp = await fetch(url);
+        const js = await resp.json();
+        const prom = js.data.reduce((a,b)=>a+b.PML,0) / js.data.length;
+        resultados.push(prom);
+        labels.push(`${d.toLocaleString('es',{month:'short'})} ${y}`);
+      }
+      return {labels, datos: resultados};
+    }
+
+    async function obtenerTarifaGDMTH() {
+      try {
+        const resp = await fetch(proxy + 'https://app.cfe.mx/Aplicaciones/CCFE/Tarifas/TarifasCRENegocio/Tarifas/GranDemandaMTH.aspx');
+        const html = await resp.text();
+        const m = html.match(/\$([\d.,]+)\s*MXN/);
+        return m ? parseFloat(m[1].replace(',','')) : 2.90;
+      } catch {
+        return 2.90;
+      }
+    }
+
+    function promedio(arr) {
+      return arr.reduce((a,b)=>a+b,0) / arr.length;
+    }
+
+    function dibujarGrafica(labels, datos) {
+      const ctx = document.getElementById('chart').getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets: [{
+          label: 'Precio Marginal Local (PML) MXN/kWh',
+          data: datos, borderColor: 'blue', fill: false
+        }]},
+        options: {
+          scales: { y: { beginAtZero: false } },
+          responsive: true
+        }
+      });
+    }
+
+    function descargarInforme() {
+      let csv = "Mes,Precio PML (MXN/kWh)\n";
+      for (let i = 0; i < labelsGlobal.length; i++) {
+        csv += `${labelsGlobal[i]},${datosGlobal[i].toFixed(4)}\n`;
+      }
+      csv += "\n" + resumenGlobal;
+
+      const blob = new Blob([csv], {type: 'text/csv'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "informe_pml.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>
